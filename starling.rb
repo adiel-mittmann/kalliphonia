@@ -66,12 +66,14 @@ class Starling
 
     forms = html
       .lines
-      .select{|line| line =~ /^<td/}
       .map   {|line| line.strip}
+      .select{|line| line =~ /^<td/ || line =~ /^<b>/}
+      .map   {|line| line.gsub(/<b>.*<\/b>/, "")}
       .map   {|line| line.gsub(/<[^<]+>/, "")}
       .map   {|line| line.split(/, */)}
       .flatten
       .reject{|line| line =~ /\*/}
+      .map   {|line| line.strip}
       .sort
       .uniq
 

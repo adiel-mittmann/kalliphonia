@@ -3,8 +3,8 @@
 require 'segmenter.rb'
 require 'starling.rb'
 
-starling = Starling.new("cache-starling")
-segmenter = Segmenter.new(File.read(ARGV[0]))
+starling = Starling.new(ARGV[0])
+segmenter = Segmenter.new(File.read(ARGV[1]))
 
 segmenter.each do |type, text|
   case
