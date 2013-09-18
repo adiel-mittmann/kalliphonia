@@ -9,37 +9,84 @@ class Starling
   RUSSIAN_UPPERCASE_ALPHABET = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
   RUSSIAN_LOWERCASE_ALPHABET = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
 
-  def initialize(cache_path)
+  EXCEPTIONS = {
+    "все" => "все!",
+    "что" => "чтo^",
+    "то" => "то^"
+  }
+
+  UNINFLECTABLES = {
+    "для"     => ["для`"],
+    "потом"   => ["пото'м"],
+    "пока"    => ["пока'"],
+    "ли"      => ["ли`"],
+    "более"   => ["бо'лее"],
+    "не"      => ["не`"],
+    "спасибо" => ["спаси'бо"],
+    "после"   => ["по'сле"],
+    "на"      => ["на`"],
+    "теперь"  => ["тепе'рь"],
+    "когда"   => ["когда'"],
+    "едва"    => ["едва'"],
+  }
+
+  DIACRITICS = ["'", '"', '!', '`', '^']
+
+  def initialize(cache_path, segmenter)
     @file_cache = FileSystemCache.new(cache_path);
+    @segmenter  = segmenter
   end
 
-  def get(word)
+  def run(text)
 
-    original = word
+    delims, words = @segmenter.run(text)
 
-    result = original
-    catch(:done) do
+    i = 0
+    while i < words.length
 
-      word = word.tr(RUSSIAN_UPPERCASE_ALPHABET, RUSSIAN_LOWERCASE_ALPHABET)
+      word = words[i]
+      original = word
+      result = original
 
-      word.each_char do |c|
-        throw :done if !RUSSIAN_LOWERCASE_ALPHABET.include?(c)
+      catch(:done) do
+
+        word = word.tr(RUSSIAN_UPPERCASE_ALPHABET, RUSSIAN_LOWERCASE_ALPHABET)
+
+        word.each_char do |c|
+          throw :done if !RUSSIAN_LOWERCASE_ALPHABET.include?(c)
+        end
+
+        # If Russian was always this easy...
+        if word =~ /ё/
+          result = word
+          throw :done
+        end
+
+        case
+        when EXCEPTIONS.has_key?(word)
+          form = EXCEPTIONS[word]
+
+        else
+
+          forms = UNINFLECTABLES[word]
+          forms = [] if !forms
+
+          forms    += self.get_forms_for_word(word)
+          form      = self.consolidate_forms(forms)
+        end
+
+        restored  = self.restore_case(form, original)
+        result    = self.encode_diacritics(restored)
+
       end
 
-      # If Russian was always this easy...
-      if word =~ /ё/
-        result = word
-        throw :done
-      end
+      words[i] = result
 
-      forms = self.get_forms_for_word(word)
-      form = self.consolidate_forms(forms)
-      restored = self.restore_case(form, original)
-      result = self.encode_diacritics(restored)
+      i += 1
 
     end
 
-    return result
+    return @segmenter.assemble(delims, words)
 
   end
 
@@ -70,7 +117,7 @@ class Starling
       .select{|line| line =~ /^<td/ || line =~ /^<b>/}
       .map   {|line| line.gsub(/<b>.*<\/b>/, "")}
       .map   {|line| line.gsub(/<[^<]+>/, "")}
-      .map   {|line| line.split(/, */)}
+      .map   {|line| line.split(/, *|\/\//)}
       .flatten
       .reject{|line| line =~ /\*/}
       .map   {|line| line.strip}
@@ -99,13 +146,21 @@ class Starling
 
       form = ""
       while forms.reduce(:+).length > 0
-        symbols_at = forms.each_with_index.map{|form, i| ["'", '"'].include?(form[0]) ? i : -1}.reject{|i| i == -1}
+        symbols_at = forms.each_with_index.map{|form, i| DIACRITICS.include?(form[0]) ? i : -1}.reject{|i| i == -1}
         case
         when symbols_at.length > 0
           symbols = forms.map{|form| form[0]}.values_at(*symbols_at).uniq
-          throw :done if symbols.length > 1
           forms = forms.each_with_index.map{|form, i| symbols_at.include?(i) ? form[1..-1] : form}
-          form << symbols.first
+          case
+          when symbols.length == 1
+            form << symbols.first
+          when ["'\"", "\"'"].include?(symbols.reduce(:+))
+            form << "!"
+          when ["'`", "`'"].include?(symbols.reduce(:+))
+            form << "^"
+          else
+            throw :done
+          end
         else
           letters = forms.map{|form| form[0]}.uniq
           throw :done if letters.length > 1
@@ -122,11 +177,11 @@ class Starling
   def restore_case(form, original)
 
     restored = ""
-    throw :done if form.gsub(/["']/, "").length != original.length
+    throw :done if form.gsub(Regexp.new("[" + DIACRITICS.reduce(:+) + "]"), "").length != original.length
 
     while original.length > 0
       case
-      when ["'", '"'].include?(form[0])
+      when DIACRITICS.include?(form[0])
         restored << form[0]
         form = form[1..-1]
       else
@@ -143,7 +198,12 @@ class Starling
   end
 
   def encode_diacritics(string)
-    string.gsub(/е"/, "ё").gsub(/'/, [0x0301].pack("U"))
+    string
+      .gsub(/е"/, "ё")
+      .gsub(/'/, [0x0301].pack("U"))
+      .gsub(/е!/, "ё" + [0x0301].pack("U"))
+      .gsub(/`/, [0x0300].pack("U"))
+      .gsub(/\^/, [0x0302].pack("U"))
   end
 
 end
