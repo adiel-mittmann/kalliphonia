@@ -28,9 +28,12 @@ class Starling
     "теперь"  => ["тепе'рь"],
     "когда"   => ["когда'"],
     "едва"    => ["едва'"],
+    "мало"    => ["ма'ло"],
+    "больно"  => ["бо'льно"],
   }
 
-  DIACRITICS = ["'", '"', '!', '`', '^']
+  DIACRITICS = ["'", '"', '!', '`', '^', "&"]
+  DIACRITICS_REGEXP = Regexp.new("([" + DIACRITICS.reduce(:+) + "])")
 
   def initialize(cache_path, segmenter)
     @file_cache = FileSystemCache.new(cache_path);
@@ -71,8 +74,8 @@ class Starling
           forms = UNINFLECTABLES[word]
           forms = [] if !forms
 
-          forms    += self.get_forms_for_word(word)
-          form      = self.consolidate_forms(forms)
+          forms, same = self.get_forms_for_word(word, forms)
+          form        = self.consolidate_forms(forms, same)
         end
 
         restored  = self.restore_case(form, original)
@@ -107,7 +110,7 @@ class Starling
     return html.force_encoding("cp1251").encode("utf-8")
   end
 
-  def get_forms_for_word(word)
+  def get_forms_for_word(word, extra)
 
     html  = self.get_html_for_word(word)
 
@@ -118,22 +121,34 @@ class Starling
       .map   {|line| line.gsub(/<b>.*<\/b>/, "")}
       .map   {|line| line.gsub(/<[^<]+>/, "")}
       .map   {|line| line.split(/, *|\/\//)}
-      .flatten
-      .reject{|line| line =~ /\*/}
-      .map   {|line| line.strip}
-      .sort
+      .reject{|line| line.map{|word| word =~ /\*/ || word == "-"}.reduce(false){|a,b| a || b}}
+      .map   {|line| line.map{|word| word.strip }}
       .uniq
+
+    forms << extra
+
+    same_form = {}
+
+    forms_letters = forms.map{|os| os.map{|o| o.gsub(DIACRITICS_REGEXP, "")}}
+    forms_letters.each_with_index do |options, i|
+      next if options.length == 1
+      next if options.uniq.length != 1
+      next if forms_letters.map{|os| os.include?(options.first)}.reject{|a| !a}.length != 1
+      same_form[options.first] = true
+    end
+
+    forms = forms.flatten.uniq
 
     map = Hash.new([])
     forms.each do |form|
       map[form.gsub(/['"]/, "")] += [form]
     end
 
-    return map[word]
+    return map[word], same_form[word]
 
   end
 
-  def consolidate_forms(forms)
+  def consolidate_forms(forms, same)
 
     case
     when forms.length == 0
@@ -170,6 +185,10 @@ class Starling
       end
     end
 
+    if same
+      form = form.gsub(DIACRITICS_REGEXP, "\\1&")
+    end
+
     return form
 
   end
@@ -177,7 +196,7 @@ class Starling
   def restore_case(form, original)
 
     restored = ""
-    throw :done if form.gsub(Regexp.new("[" + DIACRITICS.reduce(:+) + "]"), "").length != original.length
+    throw :done if form.gsub(DIACRITICS_REGEXP, "").length != original.length
 
     while original.length > 0
       case
@@ -204,6 +223,7 @@ class Starling
       .gsub(/е!/, "ё" + [0x0301].pack("U"))
       .gsub(/`/, [0x0300].pack("U"))
       .gsub(/\^/, [0x0302].pack("U"))
+      .gsub(/&/, [0x0323].pack("U"))
   end
 
 end
