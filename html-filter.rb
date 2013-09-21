@@ -47,8 +47,6 @@ class HtmlFilter
 
   def output(s)
     @result << s
-    STDOUT.write(s)
-    STDOUT.flush
   end
 
 end
