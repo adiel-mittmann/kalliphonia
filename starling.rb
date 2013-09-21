@@ -2,12 +2,12 @@
 require 'net/http'
 require 'open-uri'
 
-require 'file-system-cache.rb'
+require 'gdbm-cache.rb'
 
 class Starling
 
   def initialize(cache_path, segmenter)
-    @file_cache = FileSystemCache.new(cache_path);
+    @file_cache = GdbmCache.new(cache_path)
     @segmenter  = segmenter
   end
 

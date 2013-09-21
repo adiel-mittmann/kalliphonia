@@ -2,8 +2,9 @@
 
 require 'segmenter.rb'
 require 'starling.rb'
-require 'html-filter.rb'
+require 'epub-filter.rb'
 
 segmenter = Segmenter.new()
 starling = Starling.new(ARGV[0], segmenter)
-puts HtmlFilter.new(starling).run(File.read(ARGV[1]))
+EpubFilter.new(starling).run(ARGV[1], ARGV[2])
+
