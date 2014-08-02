@@ -1,344 +1,211 @@
 # -*- coding: utf-8 -*-
 require 'net/http'
 require 'open-uri'
-
 require 'gdbm-cache.rb'
+require 'starling-parser.rb'
+require 'segmenter.rb'
+require 'russian.rb'
 
 class Starling
 
-  def initialize(cache_path, segmenter)
-    @file_cache = GdbmCache.new(cache_path)
-    @segmenter  = segmenter
+  def initialize(cache: nil, use_html_cache: true, use_result_cache: true, use_ascii: false, fall_back: nil, clean_result_cache: false)
+    @cache            = cache
+    @use_html_cache   = use_html_cache
+    @use_result_cache = use_result_cache
+    @use_ascii        = use_ascii
+    @fall_back        = fall_back
+    @segmenter        = Segmenter.new()
+
+    if clean_result_cache && cache
+      @cache.delete{|key| key =~ /^result/}
+    end
   end
 
   def run(text)
-
     delims, words = @segmenter.run(text)
 
-    i = 0
-    while i < words.length
-
-      word = words[i]
-      original = word
-      result = original
-
-      catch(:done) do
-
-        word = word.tr(RUSSIAN_UPPERCASE_ALPHABET, RUSSIAN_LOWERCASE_ALPHABET)
-
-        word.each_char do |c|
-          throw :done if !RUSSIAN_LOWERCASE_ALPHABET.include?(c)
-        end
-
-        # If Russian was always this easy...
-        if word =~ /ё/
-          result = word
-          throw :done
-        end
-
-        case
-        when EXCEPTIONS.has_key?(word)
-          form = EXCEPTIONS[word]
-
-        else
-
-          forms = UNINFLECTABLES[word]
-          forms = [] if !forms
-
-          forms, same = self.get_forms_for_word(word, forms)
-          form        = self.consolidate_forms(forms, same)
-        end
-
-        restored  = self.restore_case(form, original)
-        result    = self.encode_diacritics(restored)
-
-      end
-
-      words[i] = result
-
-      i += 1
-
+    words = words.map do |word|
+      result = self.process_word(word)
+      print result + " "
+      result
     end
+    puts
 
     return @segmenter.assemble(delims, words)
-
   end
 
   protected
 
-  def get_html_for_word(word)
-    key = "#{word}.html"
+  def process_word(word)
+    cached = self.get_cached_result(word)
+    return cached if cached
 
-    html = @file_cache.get(key)
-    if !html
-      mangled = URI::encode(word.encode("cp1251"))
-      uri = "http://starling.rinet.ru/cgi-bin/morph.cgi?flags=wndnnnnp&root=config&word=#{mangled}"
-      data = open(uri).read()
-      @file_cache.put(key, data)
-      html = data
+    original = word
+    result   = nil
+
+    catch(:cancel) do
+      throw :cancel if !Russian::only_russian_letters?(word)
+      word = Russian::to_lower(word)
+
+      forms = self.find_forms_for_word(word)
+      if @fall_back && (forms.size == 0 || FURTHER.include?(word))
+        forms += @fall_back.run(word).map{|form| {:form => form, :pos => :unknown}}
+      end
+      throw :cancel if forms.size == 0
+
+      forms = forms.map{|form| self.diversify_diacritics(form)}
+      form  = self.consolidate_forms(forms)
+      form  = self.restore_case(form, original)
+      form  = self.encode_diacritics(form) if !@use_ascii
+
+      result = form
     end
 
-    return html.force_encoding("cp1251").encode("utf-8")
+    result = original if !result
+    self.set_cached_result(original, result)
+    return result
   end
 
-  def get_forms_for_word(word, extra)
-
-    html  = self.get_html_for_word(word)
-
-    forms = html
-      .lines
-      .map   {|line| line.strip}
-      .select{|line| line =~ /^<td/ || line =~ /^<b>/}
-      .map   {|line| line.gsub(/<b>.*<\/b>/, "")}
-      .map   {|line| line.gsub(/<[^<]+>/, "")}
-      .map   {|line| line.split(/, *|\/\//)}
-      .reject{|line| line.map{|word| word =~ /\*/ || word == "-"}.reduce(false){|a,b| a || b}}
-      .map   {|line| line.map{|word| word.strip }}
-      .uniq
-
-    forms << extra
-
-    same_form = {}
-
-    forms_letters = forms.map{|os| os.map{|o| o.gsub(DIACRITICS_REGEXP, "")}}
-    forms_letters.each_with_index do |options, i|
-      next if options.length == 1
-      next if options.uniq.length != 1
-      next if forms_letters.map{|os| os.include?(options.first)}.reject{|a| !a}.length != 1
-      same_form[options.first] = true
-    end
-
-    forms = forms.flatten.uniq
-
-    map = Hash.new([])
-    forms.each do |form|
-      map[form.gsub(DIACRITICS_REGEXP, "")] += [form]
-    end
-
-    return map[word], same_form[word]
-
-  end
-
-  def consolidate_forms(forms, same)
-
+  def find_forms_for_word(word)
     case
-    when forms.length == 0
-      throw :done
+    when word =~ /ё/            then [{:form => word.gsub(/ё/, 'е"'), :pos => :unknown}]
+    when REPLACE.has_key?(word) then REPLACE[word]
+    else                             self.parse_forms_for_word(word) + (APPEND[word] || [])
+    end
+  end
 
-    when forms.length == 1
-      form = forms.first
+  def parse_forms_for_word(word)
+    StarlingParser.new.parse(self.get_html_for_word(word)).matching_forms(word)
+  end
 
-    else
+  def fetch_starling(word)
+    uri  = "http://starling.rinet.ru/cgi-bin/morph.cgi?flags=wndnnnnp&root=config&word=#{URI::encode(word.encode("cp1251"))}"
+    html = open(uri).read()
+    @cache.put("html/#{word}.html", html) if @cache && @use_html_cache
+    return reencode_html(html)
+  end
 
-      form = ""
-      while forms.reduce(:+).length > 0
-        symbols_at = forms.each_with_index.map{|form, i| DIACRITICS.include?(form[0]) ? i : -1}.reject{|i| i == -1}
-        case
-        when symbols_at.length > 0
-          symbols = forms.map{|form| form[0]}.values_at(*symbols_at).uniq
-          forms = forms.each_with_index.map{|form, i| symbols_at.include?(i) ? form[1..-1] : form}
-          case
-          when symbols.length == 1
-            form << symbols.first
-          when ["'\"", "\"'"].include?(symbols.reduce(:+))
-            form << "!"
-          when ["'`", "`'"].include?(symbols.reduce(:+))
-            form << "^"
-          else
-            throw :done
+  def reencode_html(html)
+    html && html.encode("utf-8", "cp1251")
+  end
+
+  def get_html_for_word(word)
+    self.get_cached_html(word) || self.fetch_starling(word)
+  end
+
+  def diversify_diacritics(form)
+    i = case form[:pos]
+        when :noun, :adjective
+          case form[:case]
+          when :gen then 2
+          when :loc then 3
+          else           1
           end
-        else
-          letters = forms.map{|form| form[0]}.uniq
-          throw :done if letters.length > 1
-          forms = forms.map{|form| form[1..-1]}
-          form << letters.first
+        when :verb  then 0
+        else             4
         end
+
+    form[:form]
+      .gsub(/'/, DIACRITICS_TABLE[i][:a_ye])
+      .gsub(/"/, DIACRITICS_TABLE[i][:a_yo])
+  end
+
+  def consolidate_forms(forms)
+    return forms.first if forms.length == 1
+
+    result = ""
+    while forms.reduce(:+).length > 0
+      symbols = forms.map{|form| form[0]}.keep_if{|c| ASCII_DIACRITICS.include?(c)}
+      case
+      when symbols.length > 0
+        result << symbols.sort_by{|c| ASCII_DIACRITICS_ORDER.index(c)}.uniq.join
+        forms = forms.map{|form| ASCII_DIACRITICS.include?(form[0]) ? form[1..-1] : form}
+      else
+        result << forms.first[0]
+        forms   = forms.map{|form| form[1..-1]}
       end
     end
 
-    if same
-      form = form.gsub(DIACRITICS_REGEXP, "\\1&")
-    end
-
-    return form
-
+    return result
   end
 
   def restore_case(form, original)
-
+    original = original.gsub("ё", "е").gsub("Ё", "Е")
     restored = ""
-    throw :done if form.gsub(DIACRITICS_REGEXP, "").length != original.length
 
-    while original.length > 0
-      case
-      when DIACRITICS.include?(form[0])
-        restored << form[0]
-        form = form[1..-1]
-      else
-        restored << original[0]
-        form = form[1..-1]
-        original = original[1..-1]
+    m = 1
+    (0..original.size - 1).each do |i|
+      restored << original[i]
+      while ASCII_DIACRITICS.include?(form[i + m]) do
+        restored << form[i + m]
+        m += 1
       end
     end
 
-    restored << form if form.length > 0
-
     return restored
-
   end
 
   def encode_diacritics(string)
-    string
-      .gsub(/е"/, "ё")
-      .gsub(/'/, [0x0301].pack("U"))
-      .gsub(/е!/, "ё" + [0x0301].pack("U"))
-      .gsub(/`/, [0x0300].pack("U"))
-      .gsub(/\^/, [0x0302].pack("U"))
-      .gsub(/&/, [0x0323].pack("U"))
+    DIACRITICS_TABLE.each do |row|
+      string = string.gsub(row[:a_ye], [row[:u_ye]].pack("U")).gsub(row[:a_yo], [row[:u_yo]].pack("U"))
+    end
+    return string
   end
 
-  RUSSIAN_UPPERCASE_ALPHABET = "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ"
-  RUSSIAN_LOWERCASE_ALPHABET = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+  def get_cached_result(word)
+    if @cache && @use_result_cache
+      result = @cache.get("result/#{word}")
+      result && result.force_encoding("utf-8")
+    end
+  end
 
-  EXCEPTIONS = {
-    "все" => "все!",
-    "что" => "чтo^",
-    "то" => "то^"
+  def set_cached_result(word, result)
+    if @cache && @use_result_cache
+      @cache.put("result/#{word}", result)
+    end
+  end
+
+  def get_cached_html(word)
+    if @cache && @use_html_cache
+      reencode_html(@cache.get("html/#{word}.html"))
+    end
+  end
+
+  def set_cached_html(word, html)
+    if @cache && @use_html_cache
+      @cache.put("html/#{word}.html", html)
+    end
+  end
+
+  DIACRITICS_TABLE = [
+                      {:u_ye => 0x0304, :u_yo => 0x0331,:a_ye => "!", :a_yo => "^"},
+                      {:u_ye => 0x0346, :u_yo => 0x032a,:a_ye => "@", :a_yo => "&"},
+                      {:u_ye => 0x0303, :u_yo => 0x0330,:a_ye => "#", :a_yo => "*"},
+                      {:u_ye => 0x0308, :u_yo => 0x0324,:a_ye => "$", :a_yo => "("},
+                      {:u_ye => 0x0307, :u_yo => 0x0323,:a_ye => "%", :a_yo => ")"},
+                     ]
+
+  ASCII_DIACRITICS = DIACRITICS_TABLE.map{|row| [row[:a_ye], row[:a_yo]]}.flatten
+  ASCII_DIACRITICS_ORDER = (DIACRITICS_TABLE.map{|row| row[:a_ye]} + DIACRITICS_TABLE.map{|row| row[:a_yo]}).join
+
+  REPLACE = {
+    "все" => [{:form =>"все'", :pos => :adjective}, {:form => 'все"', :pos => :adjective}],
+    "абы" => [{:form =>"а'бы", :pos => :uknown}],
+    "денег" => [{:form => "де'нег", :pos => :noun, :case => :gen, :number => :plural}]
   }
 
-  UNINFLECTABLES = {
-
-
-    "а также" => ["а' та'кже"],
-    "а" => ["а'"],
-    "абы" => ["а'бы"],
-    "без" => ["бе`з"],
-    "безо" => ["бе`зо"],
-    "благодаря" => ["благодаря'"],
-    "близ" => ["бли'з"],
-    "более" => ["бо'лее"],
-    "больно" => ["бо'льно"],
-    "будто" => ["бу'дто"],
-    "в итоге" => ["в ито'ге"],
-    "в результате" => ["в результа'те"],
-    "в то время как" => ["в то` вре'мя ка'к"],
-    "виду" => ["виду'"],
-    "вдоль" => ["вдо'ль"],
-    "ведь" => ["ве`дь"],
-    "вместо" => ["вме'сто"],
-    "вне" => ["вне'"],
-    "внутри" => ["внутри'"],
-    "возле" => ["во'зле"],
-    "вокруг" => ["вокру'г"],
-    "вопреки" => ["вопреки'"],
-    "всё-таки" => ["всё-таки`"],
-    "где" => ["где'"],
-    "да" => ["да'"],
-    "дабы" => ["да'бы"],
-    "для" => ["для`"],
-    "до сих пор" => ["до` си`х по'р"],
-    "до тех пор пока" => ["до` те'х по'р пока'"],
-    "до" => ["до`"],
-    "едва" => ["едва'"],
-    "ежели" => ["е'жели"],
-    "если не" => ["е'сли не`"],
-    "если только" => ["е'сли то`лько"],
-    "если" => ["е'сли"],
-    "еслибы" => ["е'слибы"],
-    "же" => ["же`"],
-    "за" => ["за`"],
-    "и" => ["и'"],
-    "ибо" => ["и'бо"],
-    "из" => ["и`з"],
-    "изо" => ["и`зо"],
-    "или" => ["и'ли"],
-    "иль" => ["и'ль"],
-    "как будто" => ["ка'к бу'дто"],
-    "как" => ["ка'к"],
-    "ко" => ["ко`"],
-    "когда" => ["когда'"],
-    "когда" => ["когда'"],
-    "коли" => ["ко'ли"],
-    "кроме" => ["кро'ме"],
-    "кто" => ["кто'"],
-    "куда" => ["куда'"],
-    "ли" => ["ли`"],
-    "ли" => ["ли`"],
-    "ль" => ["ль"],
-    "мало" => ["ма'ло"],
-    "мало" => ["ма'ло"],
-    "между" => ["ме'жду"],
-    "мимо" => ["ми'мо"],
-    "много" => ["мно'го"],
-    "моему" => ["мо'ему"],
-    "на" => ["на`"],
-    "над" => ["на`д"],
-    "надо" => ["на'до"],
-    "накануне" => ["накану'не"],
-    "наперекор" => ["напереко'р"],
-    "напротив" => ["напро'тив"],
-    "настолько" => ["насто'лько"],
-    "не говоря уже о" => ["не` говоря' уже` о`"],
-    "не" => ["не`"],
-    "нежели" => ["неже'ли"],
-    "нервно" => ["не'рвно"],
-    "несколько" => ["не'сколько"],
-    "несмотря на то, что" => ["несмотря' на` то', что'"],
-    "ни" => ["ни'"],
-    "но" => ["но'"],
-    "о" => ["о`"],
-    "об" => ["о`б"],
-    "обо" => ["о`бо"],
-    "около" => ["о'коло"],
-    "от" => ["о`т"],
-    "ото" => ["о`то"],
-    "перед" => ["пе'ред"],
-    "по" => ["по`"],
-    "под" => ["по`д"],
-    "пока не" => ["пока' не`"],
-    "пока" => ["пока'"],
-    "пока" => ["пока'"],
-    "покуда" => ["поку'да"],
-    "поскольку" => ["поско'льку"],
-    "после того, как" => ["по'сле того', ка'к"],
-    "после" => ["по'сле"],
-    "посреди" => ["посреди'"],
-    "потом" => ["пото'м"],
-    "потому что" => ["потому' что`"],
-    "правда" => ["пра'вда"],
-    "при" => ["при`"],
-    "про" => ["про`"],
-    "против" => ["про'тив"],
-    "пусть" => ["пу'сть"],
-    "ради" => ["ра'ди"],
-    "раз" => ["ра'з"],
-    "ровно" => ["ро'вно'"],
-    "с тех пор как" => ["с те'х по'р ка'к"],
-    "сквозь" => ["скво'зь"],
-    "сколь" => ["ско'ль"],
-    "словно" => ["сло'вно"],
-    "со" => ["со`"],
-    "согласно" => ["согла'сно"],
-    "спасибо" => ["спаси'бо"],
-    "среди" => ["среди'"],
-    "так как" => ["та'к ка'к"],
-    "твоему" => ["тво'ему"],
-    "теперь" => ["тепе'рь"],
-    "то" => ["то'"],
-    "тогда как" => ["тогда' ка'к"],
-    "точно" => ["то'чно"],
-    "у" => ["у`"],
-    "хотя бы" => ["хотя' бы`"],
-    "хотя" => ["хотя'"],
-    "чем" => ["че'м"],
-    "через" => ["че'рез"],
-    "что касается" => ["что' каса'ется"],
-    "что" => ["что'"],
-    "чтоб" => ["что'б"],
-    "чтобы" => ["что'бы"],
+  APPEND = {
+    "моему" => [{:form => "мо'ему", :pos => :adjective}],
+    "твоему" => [{:form => "тво'ему", :pos => :adjective}],
+    "часа"  => [{:form => "часа'",  :pos => :noun}],
+    "виду"  => [{:form => "виду'",  :pos => :noun}],
+    "несмотря" => [{:form => "несмотря'",  :pos => :unknown}],
   }
 
-  DIACRITICS = ["'", '"', '!', '`', '^', "&"]
-  DIACRITICS_REGEXP = Regexp.new("([" + DIACRITICS.reduce(:+) + "])")
+  FURTHER = [
+             "после", "кругом", "потом", "перед", "уже",
+             "дабы", "коли",
+             "больно", "мало", "нервно",
+            ]
 
 end
