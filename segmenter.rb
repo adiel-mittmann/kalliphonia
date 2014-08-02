@@ -7,7 +7,7 @@ class Segmenter
   def each(text)
     @text = text
 
-    while @text =~ /[\/,.!? ()\[\]{}#&=";_*:0-9\-\n\r\t— «»]+/
+    while @text =~ /[\/,.!? ()\[\]{}#&=";_*:0-9\-\n\r\t— «»…„“]+/
 
       yield :word,      $~.pre_match if $~.pre_match.length > 0
       yield :delimiter, $~.to_s
