@@ -27,4 +27,16 @@ class GdbmCache
     @gdbm[key] = value
   end
 
+  def delete(&block)
+    keys = @gdbm.keys
+    keys.each do |key|
+      if yield(key)
+        @gdbm.delete(key)
+      end
+    end
+    @gdbm.sync
+    @gdbm.reorganize
+    @gdbm.sync
+  end
+
 end
