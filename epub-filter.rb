@@ -16,7 +16,7 @@ class EpubFilter
         out.put_next_entry(entry.name)
         if !entry.directory?
          contents = entry.get_input_stream.read()
-          if entry.name =~ /\.html$/
+          if entry.name =~ /\.x?html$/
             contents = @html_filter.run(contents.force_encoding('utf-8'))
           end
           out.write contents
